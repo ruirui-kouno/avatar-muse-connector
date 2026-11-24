@@ -1,0 +1,5 @@
+# 秘密情報はリポジトリに入れない
+config.local.json
+muse-connector.json
+pairing.json
+__pycache__/
