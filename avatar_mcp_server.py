@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-avatar_mcp_server.py — アバター「身体」ブリッジを MUSE に繋ぐ MCP アダプター。
+avatar_mcp_server.py — アバター v2 の「身体」を MUSE に繋ぐ MCP アダプター。
 
-設計（plugin-design-20261123.md）:
+設計（v2）:
   - 脳はユーザーの自分の MUSE。ここは「声と体」の受け口だけを担う。
-  - 既存ブリッジ（bridge_server.py）の HTTP API の上に被せる薄い層で、
-    ブリッジ本体は作り直さない。
+  - 接続は中継（avatar-relay2）の部屋モデル。ペアリングは番号 claim で
+    ~/.avatar2/config.json に保存される（pair_claim.py）。
+  - 同梱の脳デーモン brain.py が中継と WebSocket で常時接続し、発話の保持・
+    相槌・VOICEVOX 合成・声の機械決定を担う。このサーバーはデーモンの
+    ローカル API（127.0.0.1、ポートは ~/.avatar2/daemon.json）の上に被せる
+    薄い層で、デーモン本体は作り直さない。
   - MCP は stdio トランスポート、依存は Python 標準ライブラリのみ。
 
 道具（ツール）:
-  avatar_say(text, emotion)          一言〜短い文を喋る（表情指定つき）
-  avatar_listen(timeout_sec)         ユーザーの次の発話を待ってテキストで返す
-  avatar_report(title, sections)     報告形式で喋る＋「本日の重点」パネル表示
-  avatar_set_background(name)        背景切替イベントをステージへ送る
-  avatar_status()                    接続とキャラの状態確認
+  avatar_listen(timeout_sec)              次の発話を待って返す
+  avatar_say(text, utterance_id, ...)     発話への回答（id指定）／発話に
+                                          紐づかない発声（id無し＝通知）
+  avatar_report(title, sections, ...)     報告形式で順に喋る
+  avatar_status()                         デーモン・接続・エンジンの状態
 
-接続情報の解決順:
-  1. 環境変数 AVATAR_BRIDGE_URL / AVATAR_ACCESS_KEY
-  2. このスクリプトと同じ場所の config.local.json（pair.py が生成）
-  3. ~/.avatar-muse/config.json
-  4. オーナー環境の既定: http://127.0.0.1:8124 と
-     ~/workspace/avatar-org/bridge/access-key.txt（存在する場合のみ）
-アクセスキーの値はログ・出力に出さない。
+v1 との違い:
+  - avatar_set_background は廃止。v2 では背景はアプリ側（ガチャ／
+    コレクション）で選ぶもので、脳側から切り替える経路は無い。
+  - 声は発話のキャラからデーモンが機械決定する。ツール側は話者を選ばない
+    （選ぶとキャラと声が食い違うため）。
+脳キー等の秘密値はログ・出力に出さない。
 """
 import json
 import os
@@ -31,65 +34,44 @@ import time
 import urllib.request
 import urllib.error
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BRIDGE = 'http://127.0.0.1:8124'
-OWNER_KEY_FILE = os.path.expanduser('~/workspace/avatar-org/bridge/access-key.txt')
-
-EXPRESSIONS = ('happy', 'serious', 'relaxed')
-
-
-def load_config():
-    cfg = {}
-    for path in (os.path.join(HERE, 'config.local.json'),
-                 os.path.expanduser('~/.avatar-muse/config.json')):
-        try:
-            with open(path, encoding='utf-8') as f:
-                cfg = json.load(f)
-            break
-        except Exception:
-            continue
-    bridge = (os.environ.get('AVATAR_BRIDGE_URL') or cfg.get('bridge_url')
-              or DEFAULT_BRIDGE)
-    key = os.environ.get('AVATAR_ACCESS_KEY') or cfg.get('access_key')
-    if not key:
-        try:
-            with open(OWNER_KEY_FILE, encoding='utf-8') as f:
-                key = f.read().strip()
-        except OSError:
-            key = None
-    return bridge.rstrip('/'), key
+HOME2 = os.environ.get('AVATAR2_HOME', os.path.expanduser('~/.avatar2'))
+CONFIG_PATH = os.path.join(HOME2, 'config.json')
+STATE_PATH = os.path.join(HOME2, 'daemon.json')
+UA = 'Mozilla/5.0 (avatar-brain)'
 
 
-BRIDGE, ACCESS_KEY = load_config()
+def daemon_base():
+    """デーモンのローカル API のベース URL。状態ファイルが無ければ None。"""
+    try:
+        with open(STATE_PATH, encoding='utf-8') as f:
+            st = json.load(f)
+        return f"http://127.0.0.1:{st['api_port']}"
+    except Exception:
+        return None
 
 
-def bridge_call(method, path, body=None, timeout=120):
-    data = json.dumps(body).encode() if body is not None else None
-    headers = {'Content-Type': 'application/json'}
-    if ACCESS_KEY:
-        headers['X-Access-Key'] = ACCESS_KEY
-    req = urllib.request.Request(BRIDGE + path, data=data, method=method,
+def daemon_call(method, path, body=None, timeout=120):
+    base = daemon_base()
+    if base is None:
+        raise RuntimeError('脳デーモンの状態ファイルが見つかりません。'
+                           '同梱の brain.py を起動してください: python3 brain.py run')
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    headers = {'User-Agent': UA}
+    if data is not None:
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(base + path, data=data, method=method,
                                  headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        raise RuntimeError('脳デーモンに接続できませんでした'
+                           f'（{type(e).__name__}）。'
+                           '同梱の brain.py が起動しているか確認してください: '
+                           'python3 brain.py run')
 
 
 # ---------------- ツール実装 ----------------
-
-def tool_say(args):
-    text = (args.get('text') or '').strip()
-    if not text:
-        raise ValueError('text が必要です')
-    emotion = args.get('emotion')
-    if emotion in EXPRESSIONS:
-        res = bridge_call('POST', '/say',
-                          {'segments': [{'text': text, 'expression': emotion}]},
-                          timeout=300)
-    else:
-        res = bridge_call('POST', '/say', {'text': text}, timeout=300)
-    return {'ok': res.get('ok'), 'delivered_to': res.get('delivered_to'),
-            'streamed': res.get('streamed')}
-
 
 def tool_listen(args):
     timeout_sec = float(args.get('timeout_sec') or 120)
@@ -99,118 +81,124 @@ def tool_listen(args):
         if remain <= 0:
             return {'ok': True, 'utterance': None,
                     'note': '時間内に発話はありませんでした'}
-        res = bridge_call('GET', f'/next-utterance?timeout={min(remain, 55):.0f}',
+        res = daemon_call('GET', f'/next?timeout={min(remain, 55):.0f}',
                           timeout=min(remain, 55) + 15)
         item = res.get('utterance')
         if item:
             return {'ok': True, 'utterance': item}
 
 
+def tool_say(args):
+    text = (args.get('text') or '').strip()
+    if not text:
+        raise ValueError('text が必要です')
+    uid = args.get('utterance_id')
+    title = args.get('title')
+    if uid:
+        # 発話への回答。声はデーモンが発話のキャラから機械決定する。
+        # 同じ id への複数回の呼び出しは「続き」として送られるので、
+        # 最初の一文を先に送ると初声が速くなる。
+        res = daemon_call('POST', '/say',
+                          {'utterance_id': uid, 'text': text,
+                           'title': title or '回答'},
+                          timeout=300)
+    else:
+        # 発話に紐づかない発声（朝の報告など）。char_id は任意。
+        res = daemon_call('POST', '/notify',
+                          {'text': text, 'char_id': args.get('char_id'),
+                           'title': title or 'お知らせ'},
+                          timeout=300)
+    return {'ok': res.get('ok'), 'credit': res.get('credit')}
+
+
 def tool_report(args):
     title = args.get('title') or '報告'
-    sections = args.get('sections') or []
-    segs, items = [], []
-    for s in sections:
-        if isinstance(s, str):
-            text, expr = s.strip(), None
-        else:
-            text = (s.get('text') or '').strip()
-            expr = s.get('expression') or s.get('x_expression')
-        if not text:
-            continue
-        seg = {'text': text}
-        if expr in EXPRESSIONS:
-            seg['expression'] = expr
-        segs.append(seg)
-        items.append(text[:40])
-    if not segs:
+    sections = []
+    for s in args.get('sections') or []:
+        text = s.strip() if isinstance(s, str) else (s.get('text') or '').strip()
+        if text:
+            sections.append(text)
+    if not sections:
         raise ValueError('sections に読み上げるテキストが必要です')
-    panel_items = args.get('panel_items') or items[:5]
-    res = bridge_call('POST', '/say',
-                      {'title': title, 'segments': segs,
-                       'panel': {'title': args.get('panel_title') or '本日の重点',
-                                 'items': panel_items}},
-                      timeout=600)
-    return {'ok': res.get('ok'), 'delivered_to': res.get('delivered_to'),
-            'streamed': res.get('streamed')}
-
-
-BG_INDEX = {'会議室': 0, 'boardroom': 0, '社長室': 1, 'president': 1,
-            '夜景': 2, 'night': 2}
-
-
-def tool_set_background(args):
-    name = args.get('name')
-    index = args.get('index')
-    if index is None:
-        if name not in BG_INDEX:
-            raise ValueError('背景名は 会議室 / 社長室 / 夜景 のいずれか'
-                             '（または index 0〜2）を指定してください')
-        index = BG_INDEX[name]
-    res = bridge_call('POST', '/control',
-                      {'type': 'background', 'index': int(index), 'name': name},
-                      timeout=15)
-    return {'ok': res.get('ok'), 'delivered_to': res.get('delivered_to'),
-            'index': int(index),
-            'note': '切替イベントは接続中ステージへ配信済み。ステージ側の'
-                    '背景イベント受信は今後の対応項目（README参照）'}
+    uid = args.get('utterance_id')
+    sent = 0
+    credit = None
+    for i, text in enumerate(sections):
+        if uid:
+            res = daemon_call('POST', '/say',
+                              {'utterance_id': uid, 'text': text,
+                               'title': title if i == 0 else '回答'},
+                              timeout=300)
+        else:
+            res = daemon_call('POST', '/notify',
+                              {'text': text, 'char_id': args.get('char_id'),
+                               'title': title if i == 0 else 'お知らせ'},
+                              timeout=300)
+        if not res.get('ok'):
+            return {'ok': False, 'sent': sent, 'credit': credit}
+        sent += 1
+        credit = res.get('credit') or credit
+    return {'ok': True, 'sent': sent, 'credit': credit}
 
 
 def tool_status(args):
-    res = bridge_call('GET', '/health', timeout=10)
-    return {'ok': res.get('ok'), 'bridge': BRIDGE,
-            'engine': res.get('engine'), 'stages_connected': res.get('stages'),
-            'utterances_pending': res.get('utterances_pending'),
-            'stats': res.get('stats')}
+    paired = os.path.isfile(CONFIG_PATH)
+    try:
+        res = daemon_call('GET', '/status', timeout=10)
+        return {'ok': res.get('ok'), 'daemon': 'running', 'paired': paired,
+                'connected': res.get('connected'),
+                'pending': res.get('pending'), 'engine': res.get('engine')}
+    except Exception as e:
+        return {'ok': False, 'daemon': 'not running', 'paired': paired,
+                'note': str(e)}
 
 
 TOOLS = [
-    {'name': 'avatar_say',
-     'description': 'アバターに一言〜短い文を喋らせる（声・口パク・表情つき）。'
-                    'emotion は happy / serious / relaxed から選べる。',
-     'inputSchema': {'type': 'object',
-                     'properties': {
-                         'text': {'type': 'string', 'description': '喋るテキスト'},
-                         'emotion': {'type': 'string',
-                                     'enum': list(EXPRESSIONS),
-                                     'description': '表情（任意）'}},
-                     'required': ['text']},
-     'handler': tool_say},
     {'name': 'avatar_listen',
-     'description': 'ユーザーがアバターに話しかけるのを待ち、次の発話を'
-                    '文字起こしテキストで返す（会話の戻り経路）。'
-                    '発話が無いまま時間切れした場合は utterance=null で返る。',
+     'description': 'ユーザーがアバターに話しかけるのを待ち、次の発話を返す'
+                    '（会話の戻り経路）。発話には id・本文・キャラID・'
+                    '呼び名・位置情報が含まれる。時間内に発話が無ければ '
+                    'utterance=null で返る。',
      'inputSchema': {'type': 'object',
                      'properties': {
                          'timeout_sec': {'type': 'number',
                                          'description': '待つ秒数（既定120）'}}},
      'handler': tool_listen},
+    {'name': 'avatar_say',
+     'description': 'アバターに喋らせる。発話への回答は utterance_id を'
+                    '付ける（声は発話のキャラの固定ボイスで自動決定され、'
+                    '同じ id への複数回は続きになる。最初の一文を先に送ると'
+                    '初声が速い）。utterance_id 無しは発話に紐づかない発声'
+                    '（報告・お知らせ）で、char_id で声のキャラを指定できる。',
+     'inputSchema': {'type': 'object',
+                     'properties': {
+                         'text': {'type': 'string', 'description': '喋るテキスト'},
+                         'utterance_id': {'type': 'string',
+                                          'description': '回答先の発話ID（任意）'},
+                         'char_id': {'type': 'string',
+                                     'description': '発声キャラID（任意・通知用）'},
+                         'title': {'type': 'string',
+                                   'description': '見出し（任意）'}},
+                     'required': ['text']},
+     'handler': tool_say},
     {'name': 'avatar_report',
-     'description': '報告形式で喋らせる。本文（sections）を順に読み上げ、'
-                    '「本日の重点」パネルに要点を表示する。朝の報告などに使う。',
+     'description': '報告形式で喋らせる。本文（sections）を短い文の列で'
+                    '渡すと、順に読み上げる。utterance_id を付けると、その'
+                    '発話への回答として（続き扱いで）送る。朝の報告などに使う。',
      'inputSchema': {'type': 'object',
                      'properties': {
                          'title': {'type': 'string', 'description': '報告の題'},
                          'sections': {'type': 'array',
-                                      'description': '読み上げる文の列（文字列、'
-                                                     'または {text, expression}）',
-                                      'items': {}},
-                         'panel_items': {'type': 'array',
-                                         'items': {'type': 'string'},
-                                         'description': 'パネルに出す要点（任意）'}},
+                                      'description': '読み上げる文の列（文字列）',
+                                      'items': {'type': 'string'}},
+                         'utterance_id': {'type': 'string',
+                                          'description': '回答先の発話ID（任意）'},
+                         'char_id': {'type': 'string',
+                                     'description': '発声キャラID（任意・通知用）'}},
                      'required': ['sections']},
      'handler': tool_report},
-    {'name': 'avatar_set_background',
-     'description': 'ステージの背景を切り替える（会議室 / 社長室 / 夜景）。',
-     'inputSchema': {'type': 'object',
-                     'properties': {
-                         'name': {'type': 'string',
-                                  'description': '背景名'},
-                         'index': {'type': 'integer',
-                                   'description': '背景番号 0〜2（任意）'}}},
-     'handler': tool_set_background},
     {'name': 'avatar_status',
-     'description': 'ブリッジ接続・音声エンジン・接続中ステージ数・'
+     'description': '脳デーモンの起動・中継への接続・音声エンジン・'
                     '未処理の発話数を確認する。',
      'inputSchema': {'type': 'object', 'properties': {}},
      'handler': tool_status},
@@ -238,7 +226,7 @@ def handle(msg):
                 'result': {'protocolVersion': '2024-11-05',
                            'capabilities': {'tools': {}},
                            'serverInfo': {'name': 'avatar-muse',
-                                          'version': '1.0.0'}}}
+                                          'version': '2.0.0'}}}
     if method == 'ping':
         return {'jsonrpc': '2.0', 'id': mid, 'result': {}}
     if method == 'tools/list':
